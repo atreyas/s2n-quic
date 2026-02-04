@@ -15,11 +15,12 @@ use crate::{
             udp as udp_pool, Environment as _,
         },
         recv, socket,
+        server::tokio::PeerFactory,
     },
 };
 use s2n_quic::server::Name;
 use s2n_quic_core::time::Clock;
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpStream;
 
 pub mod rpc {
@@ -61,12 +62,17 @@ impl Handshake for crate::psk::client::Provider {
     }
 }
 
+type PeerConnect<S> = Arc<
+    dyn Fn(SocketAddr, secret::map::Peer, &Environment<S>) -> io::Result<Stream<S>> + Send + Sync,
+>;
+
 #[derive(Clone)]
 pub struct Client<H: Handshake + Clone, S: event::Subscriber + Clone> {
     env: Environment<S>,
     handshake: H,
     default_protocol: socket::Protocol,
     linger: Option<Duration>,
+    peer_connect: Option<PeerConnect<S>>,
 }
 
 impl<H: Handshake + Clone, S: event::Subscriber + Clone> Client<H, S> {
@@ -131,10 +137,10 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Client<H, S> {
                 self.connect_tcp(handshake_addr, acceptor_addr, server_name)
                     .await
             }
-            protocol => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid default protocol {protocol:?}"),
-            )),
+            socket::Protocol::Other(_) => {
+                self.connect_other(handshake_addr, acceptor_addr, server_name)
+                    .await
+            }
         }
     }
 
@@ -177,6 +183,27 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Client<H, S> {
                 format!("invalid default protocol {protocol:?}"),
             )),
         }
+    }
+
+    /// Connects using a custom peer factory (e.g., EFA/RDMA)
+    #[inline]
+    pub async fn connect_other(
+        &self,
+        handshake_addr: SocketAddr,
+        acceptor_addr: SocketAddr,
+        server_name: Name,
+    ) -> io::Result<Stream<S>> {
+        let peer_connect = self.peer_connect.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no peer factory configured for Protocol::Other",
+            )
+        })?;
+
+        let entry = self
+            .handshake_for_connect(handshake_addr, server_name)
+            .await?;
+        (peer_connect)(acceptor_addr, entry, &self.env)
     }
 
     /// Connects using the UDP transport layer
@@ -381,7 +408,37 @@ impl Builder {
             handshake,
             default_protocol,
             linger,
+            peer_connect: None,
         })
+    }
+
+    /// Builds a client configured with a custom peer factory for Protocol::Other
+    #[inline]
+    pub fn build_with_peer_factory<H, S, F>(
+        self,
+        handshake: H,
+        subscriber: S,
+        factory: F,
+    ) -> io::Result<Client<H, S>>
+    where
+        H: Handshake + Clone,
+        S: event::Subscriber + Clone,
+        F: PeerFactory<S> + 'static,
+        F::Peer: Send + 'static,
+    {
+        let mut client = self
+            .with_default_protocol(socket::Protocol::Other("custom".into()))
+            .build(handshake, subscriber)?;
+
+        let connect_fn = move |remote_addr: SocketAddr,
+                               entry: secret::map::Peer,
+                               env: &Environment<S>|
+              -> io::Result<Stream<S>> {
+            let peer = factory.create_peer(remote_addr, &[])?;
+            connect_with_peer(entry, peer, env)
+        };
+        client.peer_connect = Some(Arc::new(connect_fn));
+        Ok(client)
     }
 }
 
@@ -596,6 +653,25 @@ where
 
     debug_assert_eq!(stream.protocol(), socket::Protocol::Tcp);
 
+    Ok(stream)
+}
+
+/// Connects using a custom peer implementation (e.g., EFA/RDMA)
+///
+/// This allows custom transport implementations to be used for the data plane
+/// while using standard handshake mechanisms for credential exchange.
+#[inline]
+pub fn connect_with_peer<Sub, P>(
+    entry: secret::map::Peer,
+    peer: P,
+    env: &Environment<Sub>,
+) -> io::Result<Stream<Sub>>
+where
+    Sub: event::Subscriber + Clone,
+    P: crate::stream::environment::Peer<Environment<Sub>>,
+{
+    let stream = endpoint::open_stream(env, entry, peer, None)?;
+    let stream = stream.connect()?;
     Ok(stream)
 }
 

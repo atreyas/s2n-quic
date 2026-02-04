@@ -11,7 +11,8 @@ use crate::{
     stream::{
         endpoint,
         environment::tokio::{self as env, Environment},
-        recv, server, TransportFeatures,
+        recv, server,
+        TransportFeatures,
     },
     uds::{self, sender::SendMsg},
 };

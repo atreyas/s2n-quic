@@ -5,7 +5,8 @@ use crate::{
     event,
     path::secret,
     stream::{
-        application::Builder as StreamBuilder,
+        application::{Builder as StreamBuilder, Stream},
+        endpoint,
         environment::{
             tokio::{self as env, Environment},
             udp as udp_pool, Environment as _,
@@ -16,6 +17,7 @@ use crate::{
     },
     sync::mpmc,
 };
+use core::marker::PhantomData;
 use core::num::{NonZeroU16, NonZeroUsize};
 use s2n_quic_core::ensure;
 use std::{io, net::SocketAddr, time::Duration};
@@ -35,6 +37,52 @@ pub const MAX_TCP_WORKERS: usize = 4;
 pub mod tcp;
 pub mod udp;
 pub mod uds;
+
+/// Factory for creating custom Peer implementations
+///
+/// This enables custom transports (e.g., EFA/RDMA) to be integrated
+/// via Protocol::Other. The factory provides transport-specific info
+/// to exchange during handshake and creates Peers after handshake completes.
+pub trait PeerFactory<S: event::Subscriber + Clone>: Send + Sync + 'static {
+    /// The peer type this factory creates
+    type Peer: crate::stream::environment::Peer<Environment<S>>;
+
+    /// Get the local transport info to send to the remote peer during handshake
+    /// For Fabric, this would be the local fabric address
+    fn local_transport_info(&self) -> Vec<u8>;
+
+    /// Create a peer for the given remote address using exchanged transport info
+    ///
+    /// # Arguments
+    /// * `remote_addr` - The remote socket address (for credentials lookup)
+    /// * `transport_info` - Custom data received from remote peer during handshake
+    fn create_peer(&self, remote_addr: SocketAddr, transport_info: &[u8]) -> io::Result<Self::Peer>;
+}
+
+/// Type-erased peer factory for storage in Builder
+trait ErasedPeerFactory<S: event::Subscriber + Clone>: Send + Sync {
+    fn local_transport_info(&self) -> Vec<u8>;
+}
+
+struct PeerFactoryWrapper<S, F>
+where
+    S: event::Subscriber + Clone,
+    F: PeerFactory<S>,
+{
+    factory: F,
+    _marker: PhantomData<S>,
+}
+
+impl<S, F> ErasedPeerFactory<S> for PeerFactoryWrapper<S, F>
+where
+    S: event::Subscriber + Clone,
+    F: PeerFactory<S>,
+    F::Peer: Send + 'static,
+{
+    fn local_transport_info(&self) -> Vec<u8> {
+        self.factory.local_transport_info()
+    }
+}
 
 // This trait is a solution to abstract local_addr and map methods
 pub trait Handshake: Clone {
@@ -74,7 +122,7 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Server<H, S> {
             .build(handshake, subscriber)
     }
 
-    pub fn builder() -> Builder {
+    pub fn builder() -> Builder<S> {
         Builder::default()
     }
 
@@ -115,13 +163,15 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Server<H, S> {
 /// https://github.com/rust-lang/rust/blob/28a58f2fa7f0c46b8fab8237c02471a915924fe5/library/std/src/os/unix/net/listener.rs#L104
 pub const DEFAULT_BACKLOG: u16 = libc::SOMAXCONN as _;
 
-pub struct Builder {
+pub struct Builder<S: event::Subscriber = crate::event::tracing::Subscriber> {
     backlog: Option<NonZeroU16>,
     workers: Option<usize>,
     acceptor_addr: SocketAddr,
     span: Option<tracing::Span>,
     enable_udp: bool,
     enable_tcp: bool,
+    enable_other: bool,
+    peer_factory: Option<Box<dyn ErasedPeerFactory<S> + Send>>,
     accept_flavor: accept::Flavor,
     linger: Option<Duration>,
     send_buffer: Option<usize>,
@@ -129,7 +179,7 @@ pub struct Builder {
     reuse_addr: Option<bool>,
 }
 
-impl Default for Builder {
+impl<S: event::Subscriber> Default for Builder<S> {
     fn default() -> Self {
         Self {
             backlog: None,
@@ -139,6 +189,8 @@ impl Default for Builder {
             span: None,
             enable_udp: true,
             enable_tcp: false,
+            enable_other: false,
+            peer_factory: None,
             linger: None,
             accept_flavor: Default::default(),
             send_buffer: None,
@@ -226,17 +278,39 @@ macro_rules! manager_builder_methods {
     };
 }
 
-impl Builder {
+impl<S: event::Subscriber + Clone> Builder<S> {
     common_builder_methods!();
     manager_builder_methods!();
 
-    pub fn build<H: Handshake + Clone, S: event::Subscriber + Clone>(
+    /// Configure a custom peer factory for Protocol::Other
+    ///
+    /// This enables custom transports (e.g., EFA/RDMA) to be used.
+    /// The factory creates Peers using transport info exchanged during handshake.
+    pub fn with_peer_factory<F>(mut self, factory: F) -> Self
+    where
+        F: PeerFactory<S>,
+        F::Peer: Send + 'static,
+    {
+        self.enable_other = true;
+        self.peer_factory = Some(Box::new(PeerFactoryWrapper {
+            factory,
+            _marker: PhantomData,
+        }));
+        self
+    }
+
+    /// Get the local transport info from the peer factory (if configured)
+    pub fn local_transport_info(&self) -> Option<Vec<u8>> {
+        self.peer_factory.as_ref().map(|f| f.local_transport_info())
+    }
+
+    pub fn build<H: Handshake + Clone>(
         mut self,
         handshake: H,
         subscriber: S,
     ) -> io::Result<Server<H, S>> {
         ensure!(
-            self.enable_udp || self.enable_tcp,
+            self.enable_udp || self.enable_tcp || self.enable_other,
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "at least one acceptor type needs to be enabled"
@@ -538,3 +612,25 @@ impl<H: Handshake + Clone, S: event::Subscriber + Clone> Start<'_, H, S> {
 
 pub(crate) use common_builder_methods;
 pub(crate) use manager_builder_methods;
+
+/// Accepts a stream using a custom peer implementation (e.g., EFA/RDMA)
+///
+/// This allows custom transport implementations to be used for the data plane.
+/// The caller is responsible for:
+/// 1. Performing credential exchange out-of-band
+/// 2. Creating the appropriate Peer implementation
+/// 3. Having the entry already in the secret map
+#[inline]
+pub fn accept_with_peer<Sub, P>(
+    entry: secret::map::Peer,
+    peer: P,
+    env: &Environment<Sub>,
+) -> io::Result<(Stream<Sub>, Duration)>
+where
+    Sub: event::Subscriber + Clone,
+    P: crate::stream::environment::Peer<Environment<Sub>>,
+{
+    let stream = endpoint::open_stream(env, entry, peer, None)?;
+    let (stream, duration) = stream.accept()?;
+    Ok((stream, duration))
+}

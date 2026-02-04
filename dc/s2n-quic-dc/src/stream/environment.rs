@@ -125,7 +125,7 @@ pub struct SocketSet<R, W = R> {
     pub source_queue_id: Option<VarInt>,
 }
 
-type SetupResult<ReadWorker, WriteWorker> =
+pub type SetupResult<ReadWorker, WriteWorker> =
     Result<(SocketSet<ReadWorker, WriteWorker>, recv::shared::RecvBuffer)>;
 
 pub trait Peer<E: Environment> {
